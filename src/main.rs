@@ -220,6 +220,15 @@ struct Client {
     /// The only way to make it works with http2 is to have wstunnel directly exposed to the internet without any reverse proxy in front of it
     #[arg(value_name = "ws[s]|http[s]://wstunnel.server.com[:port]", value_parser = parse_server_url, verbatim_doc_comment)]
     remote_addr: Url,
+
+    /// [Optional] Certificate (pem) to present to the server when connecting over TLS (HTTPS). Used when the server requires
+    /// clients to authenticate themselves with a certiciate (i.e. mTLS).
+    #[arg(long, value_name = "FILE_PATH", verbatim_doc_comment)]
+    tls_certificate: Option<PathBuf>,
+
+    /// [Optional] The private key for the corresponding certificate used with mTLS.
+    #[arg(long, value_name = "FILE_PATH", verbatim_doc_comment)]
+    tls_private_key: Option<PathBuf>,
 }
 
 #[derive(clap::Args, Debug)]
@@ -284,6 +293,11 @@ struct Server {
     /// The private key will be automatically reloaded if it changes
     #[arg(long, value_name = "FILE_PATH", verbatim_doc_comment)]
     tls_private_key: Option<PathBuf>,
+
+    /// [Optional] Enables mTLS (client authentication with certificate). Argument must be PEM file
+    /// containing one or more certificates of CA's of which the certificate of clients needs to be signed with.
+    #[arg(long, value_name = "FILE_PATH", verbatim_doc_comment)]
+    tls_client_ca_certs: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -566,14 +580,18 @@ pub struct TlsClientConfig {
     pub tls_sni_override: Option<DnsName>,
     pub tls_verify_certificate: bool,
     pub tls_connector: TlsConnector,
+    pub tls_certificate: Option<Vec<Certificate>>,
+    pub tls_key: Option<PrivateKey>,
 }
 
 #[derive(Debug)]
 pub struct TlsServerConfig {
     pub tls_certificate: Mutex<Vec<Certificate>>,
     pub tls_key: Mutex<PrivateKey>,
+    pub tls_client_ca_certificates: Option<Vec<Certificate>>,
     pub tls_certificate_path: Option<PathBuf>,
     pub tls_key_path: Option<PathBuf>,
+    pub tls_client_ca_certs_path: Option<PathBuf>,
 }
 
 pub struct WsServerConfig {
@@ -682,6 +700,17 @@ async fn main() {
 
     match args.commands {
         Commands::Client(args) => {
+            let tls_certificate = if let Some(cert_path) = &args.tls_certificate {
+                Some(tls::load_certificates_from_pem(cert_path).expect("Cannot load client TLS certificate (mTLS)"))
+            } else {
+                None
+            };
+            let tls_key = if let Some(key_path) = &args.tls_private_key {
+                Some(tls::load_private_key_from_file(key_path).expect("Cannot load client TLS private key (mTLS)"))
+            } else {
+                None
+            };
+
             let tls = match TransportScheme::from_str(args.remote_addr.scheme()).expect("invalid scheme in server url")
             {
                 TransportScheme::Ws | TransportScheme::Http => None,
@@ -690,22 +719,30 @@ async fn main() {
                         args.tls_verify_certificate,
                         Some(vec![b"http/1.1".to_vec()]),
                         !args.tls_sni_disable,
+                        tls_certificate.clone(),
+                        tls_key.clone(),
                     )
                     .expect("Cannot create tls connector"),
                     tls_sni_override: args.tls_sni_override,
                     tls_verify_certificate: args.tls_verify_certificate,
                     tls_sni_disabled: args.tls_sni_disable,
+                    tls_certificate,
+                    tls_key,
                 }),
                 TransportScheme::Https => Some(TlsClientConfig {
                     tls_connector: tls::tls_connector(
                         args.tls_verify_certificate,
                         Some(vec![b"h2".to_vec()]),
                         !args.tls_sni_disable,
+                        tls_certificate.clone(),
+                        tls_key.clone(),
                     )
                     .expect("Cannot create tls connector"),
                     tls_sni_override: args.tls_sni_override,
                     tls_verify_certificate: args.tls_verify_certificate,
                     tls_sni_disabled: args.tls_sni_disable,
+                    tls_certificate,
+                    tls_key,
                 }),
             };
 
@@ -1120,11 +1157,19 @@ async fn main() {
                     embedded_certificate::TLS_PRIVATE_KEY.clone()
                 };
 
+                let tls_client_ca_certificates = if let Some(tls_client_ca) = &args.tls_client_ca_certs {
+                    Some(tls::load_certificates_from_pem(tls_client_ca).expect("Cannot load client CA certificate (mTLS)"))
+                } else {
+                    None
+                };
+
                 Some(TlsServerConfig {
                     tls_certificate: Mutex::new(tls_certificate),
                     tls_key: Mutex::new(tls_key),
+                    tls_client_ca_certificates,
                     tls_certificate_path: args.tls_certificate,
                     tls_key_path: args.tls_private_key,
+                    tls_client_ca_certs_path: args.tls_client_ca_certs,
                 })
             } else {
                 None

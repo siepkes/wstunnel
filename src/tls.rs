@@ -14,6 +14,7 @@ use tokio_rustls::rustls::client::{ServerCertVerified, ServerCertVerifier};
 use crate::tunnel::TransportAddr;
 use tokio_rustls::rustls::{Certificate, ClientConfig, KeyLogFile, PrivateKey, ServerName};
 use tokio_rustls::{rustls, TlsAcceptor, TlsConnector};
+use tokio_rustls::rustls::server::{AllowAnyAuthenticatedClient, NoClientAuth};
 use tracing::info;
 
 struct NullVerifier;
@@ -67,6 +68,8 @@ pub fn tls_connector(
     tls_verify_certificate: bool,
     alpn_protocols: Option<Vec<Vec<u8>>>,
     enable_sni: bool,
+    tls_client_certificate: Option<Vec<Certificate>>,
+    tls_client_key: Option<PrivateKey>,
 ) -> anyhow::Result<TlsConnector> {
     let mut root_store = rustls::RootCertStore::empty();
 
@@ -79,10 +82,20 @@ pub fn tls_connector(
         }
     }
 
-    let mut config = ClientConfig::builder()
+    let config_builder = ClientConfig::builder()
         .with_safe_defaults()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
+        .with_root_certificates(root_store);
+    let mut config;
+
+    if let (Some(tls_client_certificate), Some(tls_client_key)) =
+        (tls_client_certificate, tls_client_key) {
+        config = config_builder.with_client_auth_cert(tls_client_certificate, tls_client_key)
+            .expect("Error setting up client for mTLS");
+
+        info!("Client mTLS (client certificate authentication) enabled");
+    } else {
+        config = config_builder.with_no_client_auth();
+    }
 
     config.enable_sni = enable_sni;
     config.key_log = Arc::new(KeyLogFile::new());
@@ -95,14 +108,28 @@ pub fn tls_connector(
     if let Some(alpn_protocols) = alpn_protocols {
         config.alpn_protocols = alpn_protocols;
     }
+
     let tls_connector = TlsConnector::from(Arc::new(config));
     Ok(tls_connector)
 }
 
 pub fn tls_acceptor(tls_cfg: &TlsServerConfig, alpn_protocols: Option<Vec<Vec<u8>>>) -> anyhow::Result<TlsAcceptor> {
+    let client_cert_verifier = if let Some (tls_client_ca_certificates) = &tls_cfg.tls_client_ca_certificates {
+        info!("Server mTLS (client certificate authentication) enabled.");
+        let mut root_store = rustls::RootCertStore::empty();
+        for tls_client_ca_certificate in tls_client_ca_certificates {
+            root_store.add(&tls_client_ca_certificate).expect("Failed to add CA certificate");
+        }
+
+        Arc::new(AllowAnyAuthenticatedClient::new(root_store))
+    } else {
+        info!("Server mTLS (client certificate authentication) disabled.");
+        NoClientAuth::boxed()
+    };
+
     let mut config = rustls::ServerConfig::builder()
         .with_safe_defaults()
-        .with_no_client_auth()
+        .with_client_cert_verifier(client_cert_verifier)
         .with_single_cert(tls_cfg.tls_certificate.lock().clone(), tls_cfg.tls_key.lock().clone())
         .with_context(|| "invalid tls certificate or private key")?;
 
